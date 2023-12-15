@@ -1,4 +1,6 @@
 const express = require('express');
+const http = require('http');
+const WebSocket = require('ws');
 const cors = require('cors');
 const { pool, testDBConnection } = require('./db');
 
@@ -6,16 +8,131 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// Initialize the HTTP server
+const server = http.createServer(app);
+
+// Create a WebSocket server
+const wss = new WebSocket.Server({ noServer: true });
+
+wss.on('connection', (ws, request) => {
+  print('connected');
+});
+
+// Attach the upgrade event to the HTTP server
+server.on('upgrade', (request, socket, head) => {
+  // This function should be defined or imported from your authentication module
+  authenticate(request, (err, client) => {
+    if (err || !client) {
+      socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      wss.emit('connection', ws, request);
+    });
+  });
+});
+app.post('/api/messages', async (req, res) => {
+    const { sender_id, recipient_id, body } = req.body;
+    try {
+        const newMessage = await pool.query(
+            'INSERT INTO messages (sender_id, recipient_id, body, created_at) VALUES ($1, $2, $3, NOW()) RETURNING *',
+            [sender_id, recipient_id, body]
+        );
+        res.json(newMessage.rows[0]);
+    } catch (err) {
+        console.error(err.message);
+        res.status(500).send('Server error');
+    }
+});
+
+// Get conversations for a user
+app.get('/api/conversations/:userId', async (req, res) => {
+    const userId = req.params.userId;
+    try {
+        const conversations = await pool.query(
+            `SELECT m.*, 
+            CASE 
+                WHEN m.sender_id = $1 THEN m.recipient_id 
+                ELSE m.sender_id 
+            END as other_user_id
+            FROM messages m
+            WHERE m.id IN (
+                SELECT MAX(id) 
+                FROM messages 
+                WHERE sender_id = $1 OR recipient_id = $1 
+                GROUP BY LEAST(sender_id, recipient_id), GREATEST(sender_id, recipient_id)
+            ) 
+            ORDER BY created_at DESC`,
+            [userId]
+        );
+        res.json(conversations.rows);
+    } catch (err) {
+        console.error(err.message);
+        res.status(500).send('Server error');
+    }
+});
+
+// Fetch messages between two users
+app.get('/api/messages/:user1Id/:user2Id', async (req, res) => {
+    const { user1Id, user2Id } = req.params;
+    try {
+      const messages = await pool.query(
+        'SELECT * FROM messages WHERE sender_id = $1 AND recipient_id = $2 OR sender_id = $2 AND recipient_id = $1 ORDER BY created_at ASC',
+        [user1Id, user2Id]
+      );
+      res.json(messages.rows);
+    } catch (err) {
+      console.error(err.message);
+      res.status(500).send('Server error');
+    }
+  });
+  
+
+
 testDBConnection();
 
 app.get('/api/posts', async (req, res) => {
+    console.log('Received query params:', req.query);
+    const { isRent, isSale, isNeed, isSwap } = req.query;
+    let query = `
+    SELECT posts.*, users.first_name, users.last_name 
+    FROM posts 
+    JOIN users ON posts.user_id = users.id`;
+    let conditions = [];
+
+    if (isRent === 'true') {
+        conditions.push('is_rent = true');
+    }
+    if (isSale === 'true') {
+        conditions.push('is_sale = true');
+    }
+    if (isNeed === 'true') {
+        conditions.push('is_need = true');
+    }
+    if (isSwap === 'true') {
+        conditions.push('is_swap = true');
+    }
+
+    if (conditions.length > 0) {
+        query += ' WHERE ' + conditions.join(' OR ');
+    }
+
+    query += ' ORDER BY created_at DESC';
+
+    console.log('Executing query:', query);
+
     try {
-        const allPosts = await pool.query('SELECT * FROM posts ORDER BY created_at DESC');
-        res.json(allPosts.rows);
+        const filteredPosts = await pool.query(query);
+        res.json(filteredPosts.rows);
     } catch (err) {
         console.error(err.message);
+        res.status(500).send('Server error');
     }
 });
+
+
 
 app.post('/api/social-login', async (req, res) => {
     let {
@@ -144,6 +261,8 @@ app.get('/api/user/:userId', async (req, res) => {
         res.status(500).send('Server error');
     }
 });
+
+
 
 app.listen(5001, () => {
     console.log('Server is running on port 5001');
